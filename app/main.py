@@ -15,18 +15,21 @@ import io
 # === Setup ===
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
+import dotenv as load_dotenv
 
 # === Paths ===
 csv_path = "./aadhaar_data.csv"
 pkl_path = "./aadhaar_data.pkl"
 
+load_dotenv()  # load variables from .env
+
 # === Redis Client ===
 try:
     r = redis.Redis(
-        host="localhost",
-        port=6379,
-        password="hqpl@123",  # 🔑 Your Redis password
-        decode_responses=True
+    host=os.getenv("REDIS_HOST"),
+    port=int(os.getenv("REDIS_PORT")),
+    password=os.getenv("REDIS_PASSWORD"),
+    decode_responses=True
     )
     r.ping()
     print("✅ Redis connected")
