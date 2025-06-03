@@ -132,6 +132,23 @@ def download_image(url):
     return Image.open(io.BytesIO(response.content))
 
 
+
+def ocr_best_orientation(image, lang='eng+hin',):
+    """Try OCR on 0, 90, 180, 270 degrees rotation and return best text based on Aadhaar pattern match."""
+    best_text = ""
+    best_score = 0  # number of Aadhaar-like matches found
+    for angle in [0, 90, 180, 270]:
+        rotated_img = image.rotate(angle, expand=True)
+        text = pytesseract.image_to_string(rotated_img, lang=lang)
+        matches = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
+        score = len(matches)
+        if score > best_score:
+            best_score = score
+            best_text = text
+            logging.info(f"🔄 Best OCR with rotation {angle}°, found {score} Aadhaar numbers")
+    return best_text
+
+
 # === Endpoint ===
 @app.get("/")
 async def root():
@@ -143,17 +160,25 @@ async def upload_via_url(request: AadhaarRequest):
     try:
         front_img = download_image(request.front_url)
         back_img = download_image(request.back_url)
+
+        
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Image download failed: {str(e)}")
 
-    front_text = pytesseract.image_to_string(front_img, lang='eng+hin')
-    back_text = pytesseract.image_to_string(back_img, lang='eng+hin')
+    front_text = ocr_best_orientation(front_img, lang='eng+hin')
+    back_text = ocr_best_orientation(back_img, lang='eng+hin')
     full_text = front_text + "\n" + back_text
-    
-    
 
     info = extract_info(full_text)
     info['User ID'] = request.user_id
+
+    if not info.get("Aadhaar Number") or not info.get("Name"):
+        return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
+
+    saved = save_data(info)
+    return {"status": "exists" if not saved else "saved", "data": info}
+
 
     if not info.get("Aadhaar Number") or not info.get("Name"):
         return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
