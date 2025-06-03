@@ -17,8 +17,8 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # === Paths ===
-csv_path = "/Users/hqpl/Desktop/Lakshya/OCR/OCR/app/aadhaar_data.csv"
-pkl_path = "/Users/hqpl/Desktop/Lakshya/OCR/OCR/app/aadhaar_data.pkl"
+csv_path = "./aadhaar_data.csv"
+pkl_path = "./aadhaar_data.pkl"
 
 # === Redis Client ===
 try:
