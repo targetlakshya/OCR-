@@ -1,0 +1,6 @@
+.env
+# Ignore all .pkl files
+*.pkl
+
+# Ignore all .csv files
+*.csv
