@@ -1,0 +1,23 @@
+# Use an official Python image
+FROM python:3.10-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    libsm6 libxext6 libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy files
+COPY . .
+
+# Install Python packages
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Expose port
+EXPOSE 8100
+
+# Start the app
+CMD ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8100"]

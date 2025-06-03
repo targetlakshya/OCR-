@@ -17,8 +17,8 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # === Paths ===
-csv_path = "aadhaar_data.csv"
-pkl_path = "aadhaar_data.pkl"
+csv_path = "/Users/hqpl/Desktop/Lakshya/OCR/OCR/app/aadhaar_data.csv"
+pkl_path = "/Users/hqpl/Desktop/Lakshya/OCR/OCR/app/aadhaar_data.pkl"
 
 # === Redis Client ===
 try:
@@ -133,6 +133,11 @@ def download_image(url):
 
 
 # === Endpoint ===
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Aadhaar Info Extractor API"}
+
+
 @app.post("/upload_url")
 async def upload_via_url(request: AadhaarRequest):
     try:
