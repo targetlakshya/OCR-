@@ -11,31 +11,30 @@ import requests
 import redis
 import logging
 import io
+from dotenv import load_dotenv
 
 # === Setup ===
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
-import dotenv as load_dotenv
+load_dotenv()
 
 # === Paths ===
 csv_path = "./aadhaar_data.csv"
 pkl_path = "./aadhaar_data.pkl"
 
-load_dotenv()  # load variables from .env
-
 # === Redis Client ===
 try:
     r = redis.Redis(
-    host=os.getenv("REDIS_HOST"),
-    port=int(os.getenv("REDIS_PORT")),
-    password=os.getenv("REDIS_PASSWORD"),
-    decode_responses=True
+        host=os.getenv("REDIS_HOST"),
+        port=int(os.getenv("REDIS_PORT")),
+        password=os.getenv("REDIS_PASSWORD"),
+        decode_responses=True
     )
     r.ping()
-    print("✅ Redis connected")
+    logging.info("✅ Redis connected")
 except redis.exceptions.ConnectionError as e:
-    print("❌ Redis connection failed")
-    print(e)
+    logging.error("❌ Redis connection failed")
+    logging.error(e)
     r = None
 
 # === Request Model ===
@@ -44,136 +43,211 @@ class AadhaarRequest(BaseModel):
     front_url: str
     back_url: str
 
-
-# === Aadhaar Info Extractor ===
+# === Extract Aadhaar Info ===
 def extract_info(text):
-    import re
-    info = {}
+    info = {
+        "Name": None,
+        "DOB": None,
+        "Gender": None,
+        "Aadhaar Number": None,
+        "VID": None,
+        "Address": None,
+    }
 
-    # Aadhaar number extraction
-    aadhaar_matches = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
-    info['Aadhaar Number'] = aadhaar_matches[0] if aadhaar_matches else None
+    # Normalize text
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    text_all = " ".join(lines)
 
-    # DOB extraction
-    dob_match = re.search(r'(?i)(DOB|D.O.B|जन्म तिथि)[^\d]*(\d{2}/\d{2}/\d{4})', text)
-    info['DOB'] = dob_match.group(2) if dob_match else None
+    # Aadhaar Number (4-4-4 digit format)
+    aadhaar_match = re.search(r"\b\d{4} \d{4} \d{4}\b", text_all)
+    if aadhaar_match:
+        info["Aadhaar Number"] = aadhaar_match.group()
 
-    # Gender extraction
-    if re.search(r'(?i)\bmale\b|पुरुष', text):
-        info['Gender'] = 'Male'
-    elif re.search(r'(?i)\bfemale\b|महिला', text):
-        info['Gender'] = 'Female'
-    else:
-        info['Gender'] = None
+    # VID (16-digit number)
+    # VID: match 16-digit number near "VID" keyword
+    vid_matches = re.findall(r"(?:VID[:;]?\s*)(\d{4} \d{4} \d{4} \d{4})", text_all)
+    if not vid_matches:
+        # fallback to just 16-digit numbers
+        vid_matches = re.findall(r"\b\d{4} \d{4} \d{4} \d{4}\b", text_all)
 
-    # Extract Name: line with capitalized words (simple heuristic)
-    lines = text.split('\n')
-    name = None
-    for line in lines:
-        line = line.strip()
-        if re.match(r'^[A-Z][a-zA-Z]*([ ][A-Z][a-zA-Z]*)+', line):
-            name = line
-            break
-    info['Name'] = name
+    if vid_matches:
+        info["VID"] = vid_matches[0]
 
-    # Address extraction with regex capturing until Aadhaar number or VID or end of text
-    address = None
-    lines = text.split('\n')
+
+    # DOB / Year of Birth
+    dob_match = re.search(r"\b(?:DOB|D0B|DoB|Birth|Year of Birth|ജനന തിയ്യതി|పుట్టిన తేదీ|பிறந்த தேதி)[^\d]*(\d{2}[/-]\d{2}[/-]\d{4}|\d{4})", text_all, re.IGNORECASE)
+    if dob_match:
+        info["DOB"] = dob_match.group(1)
+
+    # Gender (Hindi, Telugu, English)
+    if re.search(r"\b(Male|पुरुष|పురుషుడు)\b", text_all, re.IGNORECASE):
+        info["Gender"] = "Male"
+    elif re.search(r"\b(Female|महिला|స్త్రీ)\b", text_all, re.IGNORECASE):
+        info["Gender"] = "Female"
+    elif re.search(r"\b(Other|अन्य|ఇతరులు)\b", text_all, re.IGNORECASE):
+        info["Gender"] = "Other"
+
+    # Name — assume it comes after "Name" keyword or appears before DOB line
     for i, line in enumerate(lines):
-        if re.search(r'(?i)(Address|पता)', line):
-            addr_lines = []
-            # Collect next 3-5 lines as address
-            for j in range(i + 1, min(i + 6, len(lines))):
-                if re.search(r'\b\d{4}\s\d{4}\s\d{4}\b|VID', lines[j]):  # Stop if Aadhaar or VID comes
-                    break
-                if lines[j].strip():  # Skip empty lines
-                    addr_lines.append(lines[j].strip())
-            address = ' '.join(addr_lines).strip()
+        if info["Name"]:
             break
-    info['Address'] = address
+        if re.search(r"\b(Name|నామం|नाम)\b", line, re.IGNORECASE):
+            # Get next line if "Name" is a keyword header
+            if i + 1 < len(lines):
+                info["Name"] = lines[i + 1]
+        elif info["DOB"] and i > 0 and re.search(info["DOB"], line):
+            # Previous line to DOB might be name
+            info["Name"] = lines[i - 1]
+
+    # Address detection — using 'Address' keyword and PIN code pattern
+    def extract_address(lines):
+        address_keywords = [
+            "address", "s/o", "c/o", "w/o", "h.no", "house", "door", "village", 
+            "post", "dist", "mandalam", "mandal", "nagar", "pincode", "near", "road", "colony"
+        ]
+        
+        address_block = []
+        in_address = False
+        keyword_found = False
+        for i, line in enumerate(lines):
+            lower_line = line.lower()
+            if any(keyword in lower_line for keyword in address_keywords):
+                in_address = True
+                keyword_found = True
+
+            if in_address:
+                address_block.append(line.strip())
+                # Stop if we see a pincode (6 digit)
+                if re.search(r"\b\d{6}\b", line):
+                    break
+                # Or if we go 4 lines ahead (assuming full address is captured)
+                if len(address_block) >= 4:
+                    break
+
+        if address_block and keyword_found:
+            address_text = " ".join(address_block)
+            address_text = re.sub(r"\s{2,}", " ", address_text)
+            address_text = re.sub(r"[^\w\s,./:-]", "", address_text)
+            return address_text
+        return None
+        
+    # Pincode
+    pin = re.search(r'\b\d{6}\b', text)
+    info['Pincode'] = pin.group(0) if pin else None
+
+    # Validation
+    if not info["Aadhaar Number"] or not info["Name"]:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "Essential fields missing", "text": text}
+        )
 
     return info
 
+
 # === Save Data ===
 def save_data(info):
-    if os.path.exists(pkl_path):
-        with open(pkl_path, 'rb') as f:
-            all_data = pickle.load(f)
-    else:
-        all_data = []
+    try:
+        if os.path.exists(pkl_path):
+            with open(pkl_path, 'rb') as f:
+                all_data = pickle.load(f)
+        else:
+            all_data = []
 
-    existing_aadhaars = [entry['Aadhaar Number'] for entry in all_data if 'Aadhaar Number' in entry]
-    if info['Aadhaar Number'] in existing_aadhaars:
-        logging.info(f"⚠️ Aadhaar {info['Aadhaar Number']} already exists.")
+        existing_aadhaars = [entry['Aadhaar Number'] for entry in all_data if 'Aadhaar Number' in entry]
+        if info['Aadhaar Number'] in existing_aadhaars:
+            logging.info(f"⚠️ Aadhaar {info['Aadhaar Number']} already exists.")
+            return False
+
+        all_data.append(info)
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(all_data, f)
+
+        file_exists = os.path.exists(csv_path)
+        with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=info.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(info)
+
+        if r:
+            redis_key = f"aadhaar:{info['Aadhaar Number']}"
+            filtered_info = {k: v for k, v in info.items() if v is not None}
+            r.hset(redis_key, mapping=filtered_info)
+            logging.info(f"✅ Data saved to Redis under key: {redis_key}")
+        return True
+    except Exception as e:
+        logging.error("❌ Error while saving data:")
+        logging.error(e)
         return False
 
-    all_data.append(info)
-    with open(pkl_path, 'wb') as f:
-        pickle.dump(all_data, f)
-
-    file_exists = os.path.exists(csv_path)
-    with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=info.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(info)
-
-    if r:
-        redis_key = f"aadhaar:{info['Aadhaar Number']}"
-        # Filter out None values before saving to Redis
-        filtered_info = {k: v for k, v in info.items() if v is not None}
-        r.hset(redis_key, mapping=filtered_info)
-        logging.info(f"✅ Data saved to Redis under key: {redis_key}")
-    return True
-
-
-# === Helper to Download and Read Image ===
+# === Download Image from URL ===
 def download_image(url):
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise HTTPException(status_code=404, detail="Image URL not accessible")
-    return Image.open(io.BytesIO(response.content))
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Image download failed: {e}")
 
-
-
-def ocr_best_orientation(image, lang='eng+hin',):
-    """Try OCR on 0, 90, 180, 270 degrees rotation and return best text based on Aadhaar pattern match."""
+# === OCR with Best Orientation ===
+def ocr_best_orientation(image, lang='eng+hin+tel'):
     best_text = ""
-    best_score = 0  # number of Aadhaar-like matches found
+    best_score = 0
     for angle in [0, 90, 180, 270]:
         rotated_img = image.rotate(angle, expand=True)
-        text = pytesseract.image_to_string(rotated_img, lang=lang)
+        try:
+            text = pytesseract.image_to_string(rotated_img, lang=lang)
+        except pytesseract.TesseractError:
+            text = pytesseract.image_to_string(rotated_img, lang='eng')
         matches = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
         score = len(matches)
         if score > best_score:
             best_score = score
             best_text = text
             logging.info(f"🔄 Best OCR with rotation {angle}°, found {score} Aadhaar numbers")
+        custom_oem_psm_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(rotated_img, lang='eng+hin+tel', config=custom_oem_psm_config)
     return best_text
 
-
-# === Endpoint ===
+# === Routes ===
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Aadhaar Info Extractor API"}
 
+@app.get("/health")
+async def health_check():
+    redis_ok = False
+    if r:
+        try:
+            redis_ok = r.ping()
+        except:
+            redis_ok = False
+    return {
+        "redis": redis_ok,
+        "csv_exists": os.path.exists(csv_path),
+        "pkl_exists": os.path.exists(pkl_path)
+    }
 
 @app.post("/upload_url")
 async def upload_via_url(request: AadhaarRequest):
-    try:
-        front_img = download_image(request.front_url)
-        back_img = download_image(request.back_url)
+    front_img = download_image(request.front_url)
+    back_img = download_image(request.back_url)
 
-        
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image download failed: {str(e)}")
-
-    front_text = ocr_best_orientation(front_img, lang='eng+hin')
-    back_text = ocr_best_orientation(back_img, lang='eng+hin')
+    front_text = ocr_best_orientation(front_img)
+    back_text = ocr_best_orientation(back_img)
     full_text = front_text + "\n" + back_text
 
+    logging.info("🔍 Extracted text from front image:\n" + front_text)
+    logging.info("🔍 Extracted text from back image:\n" + back_text)
+
     info = extract_info(full_text)
+
+    # 👇 Check if extract_info returned JSONResponse
+    if isinstance(info, JSONResponse):
+        return info
+
+    # ✅ Now it's safe to assign
     info['User ID'] = request.user_id
 
     if not info.get("Aadhaar Number") or not info.get("Name"):
@@ -181,11 +255,3 @@ async def upload_via_url(request: AadhaarRequest):
 
     saved = save_data(info)
     return {"status": "exists" if not saved else "saved", "data": info}
-
-
-    if not info.get("Aadhaar Number") or not info.get("Name"):
-        return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
-
-    saved = save_data(info)
-    return {"status": "exists" if not saved else "saved", "data": info}
-
