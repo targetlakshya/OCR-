@@ -46,53 +46,67 @@ class AadhaarRequest(BaseModel):
 
 
 # === Aadhaar Info Extractor ===
-def extract_info(text):
-    import re
+def extract_info(text, source='front'):
     info = {}
 
-    # Aadhaar number extraction
-    aadhaar_matches = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
-    info['Aadhaar Number'] = aadhaar_matches[0] if aadhaar_matches else None
+    if source == 'front':
+        # Aadhaar Number
+        # Aadhaar Number (12-digit)
+        aadhaar_match = re.search(r'\b\d{4} \d{4} \d{4}\b', text)
+        info['Aadhaar Number'] = aadhaar_match.group() if aadhaar_match else None
 
-    # DOB extraction
-    dob_match = re.search(r'(?i)(DOB|D.O.B|जन्म तिथि)[^\d]*(\d{2}/\d{2}/\d{4})', text)
-    info['DOB'] = dob_match.group(2) if dob_match else None
+        # VID (16-digit)
+        vid_match = re.search(r'VID\s*:?\s*(\d{4} \d{4} \d{4} \d{4})', text)
+        info['VID'] = vid_match.group(1) if vid_match else None
 
-    # Gender extraction
-    if re.search(r'(?i)\bmale\b|पुरुष', text):
-        info['Gender'] = 'Male'
-    elif re.search(r'(?i)\bfemale\b|महिला', text):
-        info['Gender'] = 'Female'
-    else:
-        info['Gender'] = None
+        # DOB
+        dob_match = re.search(r'(?i)(DOB|D.O.B|जन्म[\s]*तिथि)[^\d]*(\d{2}[-/]\d{2}[-/]\d{4})', text)
+        if dob_match:
+            info['DOB'] = dob_match.group(2)
+        else:
+            dob_fallback = re.search(r'\b\d{2}[-/]\d{2}[-/]\d{4}\b', text)
+            info['DOB'] = dob_fallback.group() if dob_fallback else None
 
-    # Extract Name: line with capitalized words (simple heuristic)
-    lines = text.split('\n')
-    name = None
-    for line in lines:
-        line = line.strip()
-        if re.match(r'^[A-Z][a-zA-Z]*([ ][A-Z][a-zA-Z]*)+', line):
-            name = line
-            break
-    info['Name'] = name
+        # Gender
+        if re.search(r'(?i)\bmale\b|पुरुष', text):
+            info['Gender'] = 'Male'
+        elif re.search(r'(?i)\bfemale\b|महिला', text):
+            info['Gender'] = 'Female'
+        else:
+            info['Gender'] = None
 
-    # Address extraction with regex capturing until Aadhaar number or VID or end of text
-    address = None
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        if re.search(r'(?i)(Address|पता)', line):
-            addr_lines = []
-            # Collect next 3-5 lines as address
-            for j in range(i + 1, min(i + 6, len(lines))):
-                if re.search(r'\b\d{4}\s\d{4}\s\d{4}\b|VID', lines[j]):  # Stop if Aadhaar or VID comes
-                    break
-                if lines[j].strip():  # Skip empty lines
-                    addr_lines.append(lines[j].strip())
-            address = ' '.join(addr_lines).strip()
-            break
-    info['Address'] = address
+        # Name
+        lines = text.split('\n')
+        name = None
+        # Improved Name extraction: Look for capitalized words without digits, and not labels
+        for line in lines:
+            if re.match(r'^[A-Z][a-z]+(?: [A-Z][a-z]+)+$', line.strip()) and not any(x in line.lower() for x in ['male', 'female', 'dob', 'vid']):
+                name = line.strip()
+                break
+
+        info['Name'] = name
+
+    elif source == 'back':
+        pin_match = re.search(r'\b\d{6}\b', text)
+        lines = text.split('\n')
+        address = None
+
+        if pin_match:
+            # Find the line with the pincode
+            pin_line_idx = next((i for i, line in enumerate(lines) if re.search(r'\b\d{6}\b', line)), -1)
+            if pin_line_idx != -1:
+                addr_lines = []
+                # Collect 3 lines above and 3 below
+                for j in range(max(0, pin_line_idx - 3), min(len(lines), pin_line_idx + 4)):
+                    l = lines[j].strip()
+                    if l and not re.search(r'\bVID\b|\b\d{4} \d{4} \d{4}\b', l):
+                        addr_lines.append(l)
+                address = ' '.join(addr_lines).strip()
+
+        info['Address'] = address
 
     return info
+
 
 # === Save Data ===
 def save_data(info):
@@ -136,7 +150,7 @@ def download_image(url):
 
 
 
-def ocr_best_orientation(image, lang='eng+hin'):
+def ocr_best_orientation(image, lang='eng+hin',):
     """Try OCR on 0, 90, 180, 270 degrees rotation and return best text based on Aadhaar pattern match."""
     best_text = ""
     best_score = 0  # number of Aadhaar-like matches found
@@ -163,28 +177,26 @@ async def upload_via_url(request: AadhaarRequest):
     try:
         front_img = download_image(request.front_url)
         back_img = download_image(request.back_url)
-
-        
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Image download failed: {str(e)}")
 
     front_text = ocr_best_orientation(front_img, lang='eng+hin')
     back_text = ocr_best_orientation(back_img, lang='eng+hin')
-    full_text = front_text + "\n" + back_text
 
-    info = extract_info(full_text)
+    front_info = extract_info(front_text, source='front')
+    back_info = extract_info(back_text, source='back')
+
+    # Merge both dicts
+    info = {**front_info, **back_info}
     info['User ID'] = request.user_id
 
-    if not info.get("Aadhaar Number") or not info.get("Name"):
-        return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
-
-    saved = save_data(info)
-    return {"status": "exists" if not saved else "saved", "data": info}
-
-
-    if not info.get("Aadhaar Number") or not info.get("Name"):
-        return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
+    missing_fields = [k for k in ["Aadhaar Number", "Name", "DOB", "Gender", "Address"] if not info.get(k)]
+    if missing_fields:
+        return JSONResponse(status_code=422, content={
+            "error": "Essential fields missing",
+            "missing_fields": missing_fields,
+            "text": front_text + "\n" + back_text
+        })
 
     saved = save_data(info)
     return {"status": "exists" if not saved else "saved", "data": info}
