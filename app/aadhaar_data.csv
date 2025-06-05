@@ -1,2 +1,3 @@
-Aadhaar Number,DOB,Gender,Name,Address,User ID
-7420 8136 8057,11/11/2004,Male,Adarsh Srivastava,"»2/O: Om Ji Srivastava, |i g plotno7,ada colony, dev prayagam jhalwa, Jhalwa, PO: a Pipaigaon, DIST: Allahabad, 4 Uttar Pradesh - 211012",user_1246
+Aadhaar Number,VID,DOB,Gender,Name,Address,Pincode,User ID
+7420 8136 8057,9176 7562 2284 6088,11/11/2004,Male,Adarsh Srivastava,"@Pipalgaon, DIST: Allahabad, 4 Uttar Pradesh - 211012 7420 8136 8057",211012,user_123
+9197 1466 1447,9197 1466 1447 8978,10/02/2005,Male,K Charan Kumar Reddy,"C/O: K Indra Sena Reddy, 11-1-117, Sai Ram Catony, Badangpet, K.v. Rangareddy, 9985 2879 7572 i",500058,user_123.1
