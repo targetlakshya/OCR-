@@ -25,9 +25,11 @@ pkl_path = "./aadhaar_data.pkl"
 # === Redis Client ===
 try:
     r = redis.Redis(
-        host=os.getenv("REDIS_HOST"),
-        port=int(os.getenv("REDIS_PORT")),
-        password=os.getenv("REDIS_PASSWORD"),
+        host="localhost",
+        port=6379,
+        db=0,
+        username="default",
+        password="hqpl@123",
         decode_responses=True
     )
     r.ping()
