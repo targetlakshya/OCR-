@@ -1,158 +1,233 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# main.py
+import io
+import re
+import csv
+import pickle
+import logging
+import subprocess
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
-import pytesseract
-import re
-import os
-import pickle
-import csv
 import requests
 import redis
-import logging
-import io
 from dotenv import load_dotenv
+from docling_core.types.io import DocumentStream  # Add this import at the top
+
+from docling.document_converter import DocumentConverter  # OCR & layout
+load_dotenv()
 
 # === Setup ===
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
-load_dotenv()
-
-# === Paths ===
-csv_path = "./aadhaar_data.csv"
-pkl_path = "./aadhaar_data.pkl"
 
 # === Redis Client ===
 try:
     r = redis.Redis(
         host="localhost",
-        port=6379,
-        db=0,
+        port="6379",
         username="default",
         password="hqpl@123",
         decode_responses=True
     )
     r.ping()
     logging.info("✅ Redis connected")
-except redis.exceptions.ConnectionError as e:
-    logging.error("❌ Redis connection failed")
-    logging.error(e)
+except Exception as e:
+    logging.error("❌ Redis unavailable")
     r = None
 
-# === Request Model ===
+csv_path = "./aadhaar_data.csv"
+pkl_path = "./aadhaar_data.pkl"
+converter = DocumentConverter()  # load docling model :contentReference[oaicite:1]{index=1}
+
 class AadhaarRequest(BaseModel):
     user_id: str
     front_url: str
     back_url: str
-    
-# === Aadhaar Data Reading Function ===
-def adhaar_read_data(text):
-    res = text.split()
-    name = None
-    dob = None
-    adh = None
-    sex = None
-    text1 = []
 
-    lines = text.split('\n')
-    for lin in lines:
-        s = lin.strip().replace('\n','').rstrip().lstrip()
-        text1.append(s)
+def download_image(url: str) -> Image.Image:
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return Image.open(io.BytesIO(resp.content))
 
-    if 'female' in text.lower():
-        sex = "Female"
-    elif 'male' in text.lower():
-        sex = "Male"
-    else:
-        sex = "Other"
-    
-    text1 = list(filter(None, text1))
-    text0 = text1[:]
-
+def upscale_image(pil_img: Image.Image, hint: str) -> Image.Image:
+    inp = f"/tmp/{hint}_in.png"
+    out_dir = "/tmp"
+    pil_img.save(inp)
     try:
-        # Improved Name Extraction
-        # Latin script names
-        name_match = re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        name = name_match.group(0) if name_match else None
-
-        # DOB cleaning
-        dob = text0[1][-10:].strip()
-        dob = dob.replace('l', '/').replace('L', '/').replace('I', '/').replace('i', '/').replace('|', '/')
-        dob = dob.replace('"', '/1').replace(":", "").replace(" ", "")
-
-        # Aadhaar Number
-        aadhaar_matches = re.findall(r"\b(?:\d{4} \d{4} \d{4}| X{4,8}\d{4})\b", text)
-        adh = aadhaar_matches[0] if aadhaar_matches else None
-        
+        subprocess.run([
+            "upscayl", "--input", inp, "--output", out_dir,
+            "--scale", "2", "--mode", "real-esrgan"
+        ], check=True)
+        # find upscaled
+        for f in os.listdir(out_dir):
+            if f.startswith(hint) and f.endswith(".png"):
+                return Image.open(os.path.join(out_dir, f))
     except Exception as e:
-        logging.warning(f"Parsing exception: {e}")
+        logging.warning(f"Upscayl failed: {e}")
+    return pil_img
 
-    logging.info(f"📤 Parsed Aadhaar Data: {name=}, {dob=}, {adh=}, {sex=}")
-    return {
-        'Name': name,
-        'Date of Birth': dob,
-        'Aadhaar Number': adh,
-        'Gender': sex,
-        'ID Type': 'Aadhaar'
-    }
+def extract_text_from_image(img: Image.Image) -> str:
+    # Resize image to max 1200px on the longest side before OCR
+    max_side = 1200
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / float(max(w, h))
+        new_size = (int(w * scale), int(h * scale))
+        img = img.resize(new_size, Image.LANCZOS)
+    # save PIL as bytes for docling: it accepts path or stream
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    doc_stream = DocumentStream(name="input.png", stream=buf)
+    result = converter.convert(doc_stream)
+    return result.document.export_to_markdown()
 
+def extract_info(front_text: str, back_text: str = None):
+    # Aadhaar Number (12 digits, with or without spaces) - search both front and back
+    aadhaar_match = re.search(r"\b\d{4} ?\d{4} ?\d{4}\b", front_text)
+    if not aadhaar_match and back_text:
+        aadhaar_match = re.search(r"\b\d{4} ?\d{4} ?\d{4}\b", back_text)
+    aadhaar_number = aadhaar_match.group(0).replace(" ", "") if aadhaar_match else None
 
-# === Extract Aadhaar Info ===
-def extract_info(text):
-    data = adhaar_read_data(text)
-    
-    # Rename keys to match your schema
-    info = {
-        "Name": data.get("Name"),
-        "Gender": data.get("Gender"),
-        "Aadhaar Number": data.get("Aadhaar Number"),
-        "VID": None,
-        "Address": None,
-        "Pincode": None,
-    }
+    # Clean lines
+    lines = [line.strip() for line in front_text.split("\n") if line.strip()]
 
-    # === Extract VID ===
-    vid_matches = re.findall(r"(?:VID[:;]?\s*)(\d{4} \d{4} \d{4} \d{4})", text)
-    if not vid_matches:
-        vid_matches = re.findall(r"\b\d{4} \d{4} \d{4} \d{4}\b", text)
-    if vid_matches:
-        info["VID"] = vid_matches[0]
-
-    # === Extract Pincode ===
-    pincode_match = re.search(r'\b\d{6}\b', text)
-    if pincode_match:
-        info['Pincode'] = pincode_match.group(0)
-
-    # === Extract Address Block ===
-    # Look for C/O or ~/O line and grab next 1–3 lines until pincode
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    address_lines = []
-    found = False
+    # Name: Try to extract from line containing gender, or from back_text if not found
+    name = None
+    skip_words = ["government of india", "republic of india", "unique identification", "authority", "aadhaar", "card", "male", "female", "dob", "year of birth", "address", "vid", "father", "mother", "image", "govt", "govt. of india"]
+    # 1. Look for name in line with gender
     for i, line in enumerate(lines):
-        if re.search(r'(?:C/O|~/O)[:\s]', line, re.IGNORECASE):
-            address_lines.append(line)
-            found = True
-            # Get up to 2 more lines below this
-            for j in range(i + 1, min(i + 4, len(lines))):
-                address_lines.append(lines[j])
+        if re.search(r"\bmale\b|पुरुष|\bfemale\b|महिला", line, re.IGNORECASE):
+            # Remove gender word and try to extract name
+            possible = re.sub(r"\b(male|female|पुरुष|महिला)\b", "", line, flags=re.IGNORECASE).strip()
+            if possible and not any(w in possible.lower() for w in skip_words):
+                name = possible
+                break
+    # 2. If not found, look for first valid line after gender line
+    if not name:
+        for i, line in enumerate(lines):
+            if re.search(r"\bmale\b|पुरुष|\bfemale\b|महिला", line, re.IGNORECASE):
+                if i+1 < len(lines):
+                    possible = lines[i+1]
+                    if not any(w in possible.lower() for w in skip_words) and len(possible.split()) >= 2:
+                        name = possible
+                        break
+    # 3. If still not found, try back_text
+    if not name and back_text:
+        back_lines = [line.strip() for line in back_text.split("\n") if line.strip()]
+        for i, line in enumerate(back_lines):
+            if re.search(r"\bmale\b|पुरुष|\bfemale\b|महिला", line, re.IGNORECASE):
+                possible = re.sub(r"\b(male|female|पुरुष|महिला)\b", "", line, flags=re.IGNORECASE).strip()
+                if possible and not any(w in possible.lower() for w in skip_words):
+                    name = possible
+                    break
+        if not name:
+            for i, line in enumerate(back_lines):
+                if re.search(r"\bmale\b|पुरुष|\bfemale\b|महिला", line, re.IGNORECASE):
+                    if i+1 < len(back_lines):
+                        possible = back_lines[i+1]
+                        if not any(w in possible.lower() for w in skip_words) and len(possible.split()) >= 2:
+                            name = possible
+                            break
+    # 4. Fallback: first valid line in front_text
+    if not name:
+        for line in lines:
+            lcline = line.lower()
+            if any(w in lcline for w in skip_words):
+                continue
+            if len(line.split()) >= 2 and re.match(r"^[A-Za-z .'-]+$", line):
+                name = line.strip()
+                break
+
+    # Gender: look for gender words near DOB or Aadhaar number
+    gender = None
+    for i, line in enumerate(lines):
+        if re.search(r"\bmale\b|पुरुष", line, re.IGNORECASE):
+            gender = "Male"
+            break
+        elif re.search(r"\bfemale\b|महिला", line, re.IGNORECASE):
+            gender = "Female"
             break
 
-    if found:
-        address_text = " ".join(address_lines)
-        # Remove known tags
-        address_text = re.sub(r'(?:C/O|~/O)[:\s]*', '', address_text, flags=re.IGNORECASE)
-        info["Address"] = address_text.strip()
+    # === Extract VID ===
+    vid_matches = re.findall(r"(?:VID[:;]?\s*)(\d{4} \d{4} \d{4} \d{4})", front_text)
+    if not vid_matches:
+        vid_matches = re.findall(r"\b\d{4} \d{4} \d{4} \d{4}\b", front_text)
+    if back_text and not vid_matches:
+        vid_matches = re.findall(r"(?:VID[:;]?\s*)(\d{4} \d{4} \d{4} \d{4})", back_text)
+        if not vid_matches:
+            vid_matches = re.findall(r"\b\d{4} \d{4} \d{4} \d{4}\b", back_text)
+    vid = vid_matches[0] if vid_matches else None
 
-    if not info["Aadhaar Number"]:
-        return JSONResponse(
-            status_code=422,
-            content={"error": "Essential fields missing", "text": text}
-        )
-    return info
+    # === Extract Pincode ===
+    pincode_match = re.search(r'\b\d{6}\b', front_text)
+    if not pincode_match and back_text:
+        pincode_match = re.search(r'\b\d{6}\b', back_text)
+    pincode = pincode_match.group(0) if pincode_match else None
 
+    address = None
+    if back_text:
+        back_lines = [line.strip() for line in back_text.split("\n") if line.strip()]
+        for i, line in enumerate(back_lines):
+            if re.search(r'(?:C/O|~/O|S/O|W/O|D/O|H/O)[:\s]', line, re.IGNORECASE):
+                address_lines = [line]
+                for j in range(i + 1, min(i + 6, len(back_lines))):
+                    address_lines.append(back_lines[j])
+                    if re.search(r'\b\d{6}\b', back_lines[j]):
+                        break
+                address_text = " ".join(address_lines)
+                address_text = re.sub(r'(?:C/O|~/O|S/O|W/O|D/O|H/O)[:\s]*', '', address_text, flags=re.IGNORECASE)
+                address = address_text.strip()
+                break
+        if not address:
+            addr_start, addr_end = -1, -1
+            for i, line in enumerate(back_lines):
+                if addr_start == -1 and re.search(r'address', line, re.IGNORECASE):
+                    addr_start = i + 1
+                if addr_start != -1 and re.search(r'\b\d{6}\b', line):
+                    addr_end = i
+                    break
+            if addr_start != -1 and addr_end > addr_start:
+                address = ' '.join(back_lines[addr_start:addr_end]).strip()
+    if not address:
+        for i, line in enumerate(lines):
+            if re.search(r'(?:C/O|~/O|S/O|W/O|D/O|H/O)[:\s]', line, re.IGNORECASE):
+                address_lines = [line]
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    address_lines.append(lines[j])
+                    if re.search(r'\b\d{6}\b', lines[j]):
+                        break
+                address_text = " ".join(address_lines)
+                address_text = re.sub(r'(?:C/O|~/O|S/O|W/O|D/O|H/O)[:\s]*', '', address_text, flags=re.IGNORECASE)
+                address = address_text.strip()
+                break
+        if not address:
+            addr_start, addr_end = -1, -1
+            for i, line in enumerate(lines):
+                if addr_start == -1 and re.search(r'address', line, re.IGNORECASE):
+                    addr_start = i + 1
+                if addr_start != -1 and re.search(r'\b\d{6}\b', line):
+                    addr_end = i
+                    break
+            if addr_start != -1 and addr_end > addr_start:
+                address = ' '.join(lines[addr_start:addr_end]).strip()
+    # Removed 422 error for missing Aadhaar number
+    return {
+        "Name": name,
+        "Gender": gender,
+        "Aadhaar Number": aadhaar_number,
+        "VID": vid,
+        "Address": address,
+        "Pincode": pincode,
+    }
 
-# === Save Data ===
-def save_data(info):
+def save_data(info: dict) -> bool:
+    # same logic as yours
     try:
         if os.path.exists(pkl_path):
             with open(pkl_path, 'rb') as f:
@@ -187,75 +262,35 @@ def save_data(info):
         logging.error(e)
         return False
 
-# === Download Image from URL ===
-def download_image(url):
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return Image.open(io.BytesIO(response.content))
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Image download failed: {e}")
-
-# === OCR with Best Orientation ===
-def ocr_best_orientation(image, lang='eng+hin+tel'):
-    best_text = ""
-    best_score = 0
-    for angle in [0, 90, 180, 270]:
-        rotated_img = image.rotate(angle, expand=True)
-        try:
-            text = pytesseract.image_to_string(rotated_img, lang='eng+hintel')
-        except pytesseract.TesseractError:
-            text = pytesseract.image_to_string(rotated_img, lang='eng+hin+tel')
-        matches = re.findall(r'\b\d{4}\s\d{4}\s\d{4}\b', text)
-        score = len(matches)
-        if score > best_score:
-            best_score = score
-            best_text = text
-            logging.info(f"🔄 Best OCR with rotation {angle}°, found {score} Aadhaar numbers")
-        custom_oem_psm_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(rotated_img, lang='eng+hin+tel', config=custom_oem_psm_config)
-    return best_text
-
-# === Routes ===
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Aadhaar Info Extractor API"}
-
-@app.get("/health")
-async def health_check():
-    redis_ok = False
-    if r:
-        try:
-            redis_ok = r.ping()
-        except:
-            redis_ok = False
-    return {
-        "redis": redis_ok,
-        "csv_exists": os.path.exists(csv_path),
-        "pkl_exists": os.path.exists(pkl_path)
-    }
-
 @app.post("/upload_url")
-async def upload_via_url(request: AadhaarRequest):
-    front_img = download_image(request.front_url)
-    back_img = download_image(request.back_url)
+async def upload_via_url(req: AadhaarRequest):
+    try:
+        front, back = download_image(req.front_url), download_image(req.back_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image download invalid: {e}")
 
-    front_text = ocr_best_orientation(front_img)
-    back_text = ocr_best_orientation(back_img)
-    full_text = front_text + "\n" + back_text
+    front, back = upscale_image(front, "front"), upscale_image(back, "back")
+    front_txt, back_txt = extract_text_from_image(front), extract_text_from_image(back)
+    full_txt = front_txt + "\n" + back_txt
+    logging.info("OCR text:\n" + full_txt)
 
-    logging.info("🔍 Extracted text from front image:\n" + front_text)
-    logging.info("🔍 Extracted text from back image:\n" + back_text)
-
-    info = extract_info(full_text)
-
+    info = extract_info(front_txt, back_txt)
     if isinstance(info, JSONResponse):
         return info
 
-    info['User ID'] = request.user_id
-
-    if not info.get("Aadhaar Number") or not info.get("Name"):
-        return JSONResponse(status_code=422, content={"error": "Essential fields missing", "text": full_text})
-
+    info.update({"User ID": req.user_id})
+    # Remove all essential field checks, always return info
     saved = save_data(info)
     return {"status": "exists" if not saved else "saved", "data": info}
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome – Aadhar Extractor️"}
+
+@app.get("/health")
+async def health():
+    return {
+        "redis": bool(r and r.ping()),
+        "csv": os.path.exists(csv_path),
+        "pkl": os.path.exists(pkl_path),
+    }
